@@ -1,5 +1,5 @@
 # Помощник в игре Celestiana
-Бот создан для автоматического решения мини-игры "сейф" в телегам боте Celestiana https://t.me/celestianabot
+Бот создан для автоматического решения мини-игры "сейф" в телеграм боте Celestiana https://t.me/celestianabot
 
 <img width="346" alt="image" src="https://github.com/user-attachments/assets/91f468f4-9d2e-40af-a5be-7b8a236de48b" /> <img width="300" alt="image" src="https://github.com/user-attachments/assets/f4b8ff15-21e6-4a12-80e7-9b43aa00dcbc" />
 
