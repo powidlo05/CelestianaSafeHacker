@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # опциональные
     CELESTIANA_ID: int = Field(5160386506, gt=0)
-    DB_FILE: str = "bot.db"
+    DB_FILE: str = "users.db"
     WAIT_TIMEOUT: int = Field(90, ge=10, le=600)      # сек. ожидания картинки
     CROP_BOX: tuple[int, int, int, int] = (170, 450, 610, 567)
 
