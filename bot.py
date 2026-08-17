@@ -37,6 +37,7 @@ dp.include_router(safe_router)
 dp.include_router(misc_router)
 
 GAME_MARKER = "Взлом сейфа начат!"
+USERNAME_RE = re.compile(r"[a-zA-Z0-9_]{4,}")
 
 
 # ================= АДМИНКА (только ЛС) =================
@@ -133,25 +134,47 @@ async def admin_id_input(message: Message, state: FSMContext):
 
 # ================= СЕЙФ (только группы) =================
 async def _extract_player(message: Message) -> tuple[int, str | None] | None:
-    """Достаёт ID (и ник) игрока из ссылки в подписи сообщения Celestiana."""
-    entities = list(message.caption_entities or []) + list(message.entities or [])
+    """Достаёт ID (и ник) игрока из ссылки в начале сообщения Celestiana."""
     raw = message.caption or message.text or ""
-    mention_nick = None
+    entities = list(message.caption_entities or []) + list(message.entities or [])
+    username = None
+
     for ent in entities:
+        # 1) упоминание с объектом user — ID напрямую
         if ent.type == "text_mention" and ent.user is not None:
             return ent.user.id, ent.user.username
+
         if ent.type == "text_link" and ent.url:
+            # 2) tg://user?id=123456
             m = re.search(r"tg://user\?id=(\d+)", ent.url)
             if m:
                 return int(m.group(1)), None
-        if ent.type == "mention" and mention_nick is None:
-            mention_nick = raw[ent.offset:ent.offset + ent.length].lstrip("@")
-    if mention_nick:
+            # 3) https://t.me/nickname
+            m = re.match(r"^(?:https?://)?t\.me/([a-zA-Z0-9_]{4,})/?$", ent.url)
+            if m:
+                username = m.group(1)
+                continue
+            # 4) текст самой ссылки — ник (как в примере: «n1tro»)
+            link_text = raw[ent.offset:ent.offset + ent.length].strip().lstrip("@")
+            if USERNAME_RE.fullmatch(link_text):
+                username = link_text
+
+        # 5) обычный @mention
+        if ent.type == "mention" and username is None:
+            username = raw[ent.offset:ent.offset + ent.length].lstrip("@")
+
+    # 6) фолбэк: первое слово подписи до запятой («n1tro, …»)
+    if username is None:
+        m = re.match(r"\s*@?([a-zA-Z0-9_]{4,})\s*,", raw)
+        if m:
+            username = m.group(1)
+
+    if username:
         try:
-            chat = await bot.get_chat(mention_nick)
+            chat = await bot.get_chat(username)
             return chat.id, chat.username
         except Exception:
-            return None
+            logger.warning("Не удалось зарезолвить ник @%s в ID", username)
     return None
 
 
@@ -172,9 +195,10 @@ async def on_photo(message: Message):
         return
     player_id, player_username = player
 
-    # проверка права пользования ботом
+    # проверка допуска: именно игрок из ссылки, а не отправитель сообщения
     if not db.is_authorized(player_id):
-        logger.info("Игрок %s без допуска — сейф пропущен", player_id)
+        logger.info("Игрок %s (@%s) без допуска — сейф пропущен",
+                    player_id, player_username)
         return
     db.update_username(player_id, player_username)
 
