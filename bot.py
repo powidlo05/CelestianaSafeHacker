@@ -1,5 +1,6 @@
+import asyncio
 import logging
-import time
+import re
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -14,8 +15,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image
 
 from config import Config
-from database import Database
 from cipher import load_cipher
+from database import Database
 from ocr import crop_code, extract_code
 
 logging.basicConfig(level=logging.INFO)
@@ -27,11 +28,19 @@ dp = Dispatcher(storage=MemoryStorage())
 db = Database(Config.DB_FILE)
 CIPHER = load_cipher()
 
-admin_router, safe_router, misc_router = Router(), Router(), Router()
-WAITING: dict[tuple[int, int], float] = {}   # (chat_id, user_id) -> время нажатия «Готов»
+admin_router = Router()
+safe_router = Router()
+misc_router = Router()
+
+dp.include_router(admin_router)
+dp.include_router(safe_router)
+dp.include_router(misc_router)
+
+GAME_MARKER = "Взлом сейфа начат!"
+USERNAME_RE = re.compile(r"[a-zA-Z0-9_]{4,}")
 
 
-# ================= АДМИНКА =================
+# ================= АДМИНКА (только ЛС) =================
 class AdminFSM(StatesGroup):
     waiting_id = State()
 
@@ -45,8 +54,19 @@ def admin_kb():
     return b.as_markup()
 
 
+async def _fetch_username(user_id: int) -> str | None:
+    try:
+        chat = await bot.get_chat(user_id)
+        return chat.username
+    except Exception:
+        return None
+
+
 @admin_router.message(Command("admin"))
 async def cmd_admin(message: Message):
+    if message.chat.type != "private":
+        await message.answer("🛠 Админ-панель доступна только в личных сообщениях.")
+        return
     if message.from_user.id != Config.ADMIN_ID:
         await message.answer("❌ У тебя нет доступа к админ-панели.")
         return
@@ -55,6 +75,8 @@ async def cmd_admin(message: Message):
 
 @admin_router.callback_query(F.data == "admin:add")
 async def cb_add(cb: CallbackQuery, state: FSMContext):
+    if cb.message.chat.type != "private":
+        return await cb.answer("❌ Админ-панель — только в личных сообщениях", show_alert=True)
     if cb.from_user.id != Config.ADMIN_ID:
         return await cb.answer("❌ Нет доступа", show_alert=True)
     await state.set_state(AdminFSM.waiting_id)
@@ -65,6 +87,8 @@ async def cb_add(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data == "admin:remove")
 async def cb_remove(cb: CallbackQuery, state: FSMContext):
+    if cb.message.chat.type != "private":
+        return await cb.answer("❌ Админ-панель — только в личных сообщениях", show_alert=True)
     if cb.from_user.id != Config.ADMIN_ID:
         return await cb.answer("❌ Нет доступа", show_alert=True)
     await state.set_state(AdminFSM.waiting_id)
@@ -75,10 +99,18 @@ async def cb_remove(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data == "admin:list")
 async def cb_list(cb: CallbackQuery):
+    if cb.message.chat.type != "private":
+        return await cb.answer("❌ Админ-панель — только в личных сообщениях", show_alert=True)
     users = db.get_all_users()
-    text = "📋 <b>Разрешённые пользователи:</b>\n" + (
-        "\n".join(f"• <code>{u}</code>" for u in users) if users else "(пусто)")
-    await cb.message.answer(text)
+    if users:
+        lines = [
+            f"• <code>{uid}</code> @{name}" if name else f"• <code>{uid}</code> (ник не известен)"
+            for uid, name in users
+        ]
+        body = "\n".join(lines)
+    else:
+        body = "(пусто)"
+    await cb.message.answer(f"📋 <b>Разрешённые пользователи:</b>\n{body}")
     await cb.answer()
 
 
@@ -92,62 +124,83 @@ async def admin_id_input(message: Message, state: FSMContext):
         return await message.answer("⚠️ ID — это число. Попробуй ещё раз.")
     uid = int(text)
     data = await state.get_data()
-    ok, msg = (db.add_user(uid) if data["action"] == "add" else db.remove_user(uid))
+    if data["action"] == "add":
+        ok, msg = db.add_user(uid, await _fetch_username(uid))
+    else:
+        ok, msg = db.remove_user(uid)
     await message.answer(msg, reply_markup=admin_kb())
     await state.clear()
 
 
-# ================= СЕЙФ =================
-@safe_router.message(F.text.func(lambda t: t.strip().lower().startswith(".аз сейф")))
-async def on_safe_command(message: Message):
-    if not db.is_authorized(message.from_user.id):
-        if message.chat.type == "private":
-            await message.answer(
-                f"❌ <b>Нет доступа.</b>\nТвой ID: <code>{message.from_user.id}</code>\n"
-                "Попроси админа добавить тебя.")
-        return
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Готов", callback_data="safe_ready")
-    await message.answer(
-        "🔐 Готов взломать сейф Celestiana.\n\n"
-        "Жми <b>«Готов»</b>, затем отправь Селестине <code>.аз сейф</code> и:\n"
-        "• перешли мне картинку с кодом (если играешь в личке),\n"
-        "• или просто жди (если я сижу в том же чате и вижу её сам).",
-        reply_markup=b.as_markup())
+# ================= СЕЙФ (только группы) =================
+async def _extract_player(message: Message) -> tuple[int, str | None] | None:
+    """Достаёт ID (и ник) игрока из ссылки в начале сообщения Celestiana."""
+    raw = message.caption or message.text or ""
+    entities = list(message.caption_entities or []) + list(message.entities or [])
+    username = None
 
+    for ent in entities:
+        # 1) упоминание с объектом user — ID напрямую
+        if ent.type == "text_mention" and ent.user is not None:
+            return ent.user.id, ent.user.username
 
-@safe_router.callback_query(F.data == "safe_ready")
-async def on_ready(cb: CallbackQuery):
-    if not db.is_authorized(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
-    WAITING[(cb.message.chat.id, cb.from_user.id)] = time.time()
-    await cb.answer("⏳ Жду картинку с кодом!")
+        if ent.type == "text_link" and ent.url:
+            # 2) tg://user?id=123456
+            m = re.search(r"tg://user\?id=(\d+)", ent.url)
+            if m:
+                return int(m.group(1)), None
+            # 3) https://t.me/nickname
+            m = re.match(r"^(?:https?://)?t\.me/([a-zA-Z0-9_]{4,})/?$", ent.url)
+            if m:
+                username = m.group(1)
+                continue
+            # 4) текст самой ссылки — ник (как в примере: «n1tro»)
+            link_text = raw[ent.offset:ent.offset + ent.length].strip().lstrip("@")
+            if USERNAME_RE.fullmatch(link_text):
+                username = link_text
+
+        # 5) обычный @mention
+        if ent.type == "mention" and username is None:
+            username = raw[ent.offset:ent.offset + ent.length].lstrip("@")
+
+    # 6) фолбэк: первое слово подписи до запятой («n1tro, …»)
+    if username is None:
+        m = re.match(r"\s*@?([a-zA-Z0-9_]{4,})\s*,", raw)
+        if m:
+            username = m.group(1)
+
+    if username:
+        try:
+            chat = await bot.get_chat(username)
+            return chat.id, chat.username
+        except Exception:
+            logger.warning("Не удалось зарезолвить ник @%s в ID", username)
+    return None
 
 
 @safe_router.message(F.photo)
 async def on_photo(message: Message):
-    sender = message.from_user.id
-    is_private = message.chat.type == "private"
+    # в личке с ботом НЕ расшифровываем никогда
+    if message.chat.type == "private":
+        return
+    if message.from_user.id != Config.CELESTIANA_ID:
+        return
+    # анонс и фото — одно сообщение: маркер и ссылка на игрока в подписи
+    if GAME_MARKER not in (message.caption or ""):
+        return
 
-    fwd_celestiana = False
-    fo = message.forward_origin
-    if fo is not None and fo.type == "user" and fo.sender_user.id == Config.CELESTIANA_ID:
-        fwd_celestiana = True
-    direct_celestiana = sender == Config.CELESTIANA_ID
+    player = await _extract_player(message)
+    if player is None:
+        logger.warning("Не удалось извлечь игрока из сообщения %s", message.message_id)
+        return
+    player_id, player_username = player
 
-    now = time.time()
-    if is_private:
-        if not db.is_authorized(sender):
-            return
-        targets = [(message.chat.id, sender)]
-    else:
-        # групповой режим: видим сообщения Celestiana напрямую
-        if not (direct_celestiana or fwd_celestiana):
-            return
-        targets = [k for k, t in list(WAITING.items())
-                   if k[0] == message.chat.id and now - t <= Config.WAIT_TIMEOUT]
-        if not targets:
-            return
+    # проверка допуска: именно игрок из ссылки, а не отправитель сообщения
+    if not db.is_authorized(player_id):
+        logger.info("Игрок %s (@%s) без допуска — сейф пропущен",
+                    player_id, player_username)
+        return
+    db.update_username(player_id, player_username)
 
     photo = message.photo[-1]
     buf = BytesIO()
@@ -174,23 +227,13 @@ async def on_photo(message: Message):
                 f"🔑 Код: <code>{digits}</code>\n\n"
                 f"Отправь Селестине:\n<code>.аз сейф {digits}</code>")
     else:
-        text = f"⚠️ Распознано с ошибкой: <code>{letters or '—'}</code>\nПроверь картинку вручную."
+        text = (f"⚠️ Распознано с ошибкой: <code>{letters or '—'}</code>\n"
+                "Проверь картинку вручную.")
 
-    if is_private:
-        await message.answer(text)
-    else:
-        await message.answer(text)  # одно сообщение в чат на всех ждущих
-    for k in targets:
-        WAITING.pop(k, None)
+    await message.reply(text)
 
 
 # ================= ПРОЧЕЕ =================
-@misc_router.message(Command("cancel"))
-async def cmd_cancel(message: Message):
-    WAITING.pop((message.chat.id, message.from_user.id), None)
-    await message.answer("❌ Ожидание сейфа отменено.")
-
-
 @misc_router.message(Command("myid"))
 async def cmd_myid(message: Message):
     await message.answer(f"🆔 Твой ID: <code>{message.from_user.id}</code>")
@@ -199,15 +242,15 @@ async def cmd_myid(message: Message):
 @misc_router.message(CommandStart())
 async def cmd_start(message: Message):
     if db.is_authorized(message.from_user.id):
+        db.update_username(message.from_user.id, message.from_user.username)
         await message.answer(
             "👋 Доступ есть!\n\n"
-            "Как пользоваться:\n"
-            "1. Напиши мне <code>.аз сейф</code>\n"
-            "2. Нажми «Готов»\n"
-            "3. Отправь Селестине <code>.аз сейф</code>\n"
-            "4. Перешли мне картинку с кодом (или я увижу сам в общем чате)\n"
-            "5. Скопируй готовый код и вставь Селестине\n\n"
-            "Админ: <code>/admin</code>")
+            "Я работаю в группах, где есть Celestiana:\n"
+            "1. Отправь <code>.аз сейф</code> в группе\n"
+            "2. Селестина пришлёт картинку с кодом\n"
+            "3. Я отвечу расшифрованным кодом — скопируй и отправь ей\n\n"
+            "В личных сообщениях я ничего не расшифровываю.\n"
+            "Админ: <code>/admin</code> (только в ЛС)")
     else:
         await message.answer(
             f"❌ <b>Нет доступа.</b>\nТвой ID: <code>{message.from_user.id}</code>\n"
@@ -225,5 +268,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
