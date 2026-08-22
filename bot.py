@@ -40,6 +40,22 @@ GAME_MARKER = "Взлом сейфа начат!"
 USERNAME_RE = re.compile(r"[a-zA-Z0-9_]{4,}")
 
 
+# ===== DEBUG =============================================================
+@dp.message.outer_middleware()
+async def debug_in(handler, event: Message, data):
+    logger.info(
+        "IN | chat=%s type=%s | from=%s | text=%r | caption=%r",
+        event.chat.id, event.chat.type,
+        event.from_user.id if event.from_user else None,
+        (event.text or "")[:60],
+        (event.caption or "")[:80],
+    )
+    return await handler(event, data)
+
+
+# ==============================================================================
+
+
 # ================= АДМИНКА (только ЛС) =================
 class AdminFSM(StatesGroup):
     waiting_id = State()
@@ -140,30 +156,24 @@ async def _extract_player(message: Message) -> tuple[int, str | None] | None:
     username = None
 
     for ent in entities:
-        # 1) упоминание с объектом user — ID напрямую
         if ent.type == "text_mention" and ent.user is not None:
             return ent.user.id, ent.user.username
 
         if ent.type == "text_link" and ent.url:
-            # 2) tg://user?id=123456
             m = re.search(r"tg://user\?id=(\d+)", ent.url)
             if m:
                 return int(m.group(1)), None
-            # 3) https://t.me/nickname
             m = re.match(r"^(?:https?://)?t\.me/([a-zA-Z0-9_]{4,})/?$", ent.url)
             if m:
                 username = m.group(1)
                 continue
-            # 4) текст самой ссылки — ник (как в примере: «n1tro»)
             link_text = raw[ent.offset:ent.offset + ent.length].strip().lstrip("@")
             if USERNAME_RE.fullmatch(link_text):
                 username = link_text
 
-        # 5) обычный @mention
         if ent.type == "mention" and username is None:
             username = raw[ent.offset:ent.offset + ent.length].lstrip("@")
 
-    # 6) фолбэк: первое слово подписи до запятой («n1tro, …»)
     if username is None:
         m = re.match(r"\s*@?([a-zA-Z0-9_]{4,})\s*,", raw)
         if m:
@@ -180,13 +190,26 @@ async def _extract_player(message: Message) -> tuple[int, str | None] | None:
 
 @safe_router.message(F.photo)
 async def on_photo(message: Message):
+    fo = message.forward_origin
+    fwd_id = fo.sender_user.id if (fo is not None and fo.type == "user" and fo.sender_user) else None
+    logger.info("PHOTO | from=%s | fwd=%s | chat_type=%s | caption=%r",
+                message.from_user.id, fwd_id, message.chat.type, (message.caption or "")[:80])
+
     # в личке с ботом НЕ расшифровываем никогда
     if message.chat.type == "private":
+        logger.info("skip: private")
         return
-    if message.from_user.id != Config.CELESTIANA_ID:
+
+    # принимаем либо напрямую от Celestiana, либо ПЕРЕСЛАННОЕ от неё сообщение
+    from_celestiana = message.from_user.id == Config.CELESTIANA_ID
+    fwd_celestiana = fwd_id == Config.CELESTIANA_ID
+    if not (from_celestiana or fwd_celestiana):
+        logger.info("skip: не Celestiana (from=%s, fwd=%s)", message.from_user.id, fwd_id)
         return
+
     # анонс и фото — одно сообщение: маркер и ссылка на игрока в подписи
     if GAME_MARKER not in (message.caption or ""):
+        logger.info("skip: маркер не найден в подписи")
         return
 
     player = await _extract_player(message)
@@ -248,9 +271,9 @@ async def cmd_start(message: Message):
             "Я работаю в группах, где есть Celestiana:\n"
             "1. Отправь <code>.аз сейф</code> в группе\n"
             "2. Селестина пришлёт картинку с кодом\n"
-            "3. Я отвечу расшифрованным кодом — скопируй и отправь ей\n\n"
-            "В личных сообщениях я ничего не расшифровываю.\n"
-            "Админ: <code>/admin</code> (только в ЛС)")
+            "3. Перешли эту картинку(вместе с подписью с твоим ником) в тот же чат\n"
+            "4. Я отвечу расшифрованным кодом — скопируй и отправь ей\n\n"
+            "В личных сообщениях я ничего не расшифровываю.\n")
     else:
         await message.answer(
             f"❌ <b>Нет доступа.</b>\nТвой ID: <code>{message.from_user.id}</code>\n"
@@ -263,7 +286,7 @@ async def cmd_help(message: Message):
 
 
 async def main():
-    db.add_user(Config.ADMIN_ID)  # админ всегда в списке
+    db.add_user(Config.ADMIN_ID, await _fetch_username(Config.ADMIN_ID))
     await dp.start_polling(bot)
 
 
